@@ -14,6 +14,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 import streamlit as st
 from pymongo import MongoClient
 import datetime
+import pandas as pd
 
 # MongoDB setup
 MONGO_URI = "mongodb+srv://choprasa:Savi3650@cluster1.f2mxsnf.mongodb.net/?retryWrites=true&w=majority&appName=Cluster1"
@@ -192,9 +193,8 @@ if st.button("Get Answer"):
                 page = doc.metadata.get("page", "N/A")
                 para = doc.metadata.get("paragraph", "N/A")
                 doc_sources[doc_id]["citations"].add(f"Page {page}, Para {para}")
-
             # Store the query result in MongoDB
-            collection.insert_one({
+            query_result = {
                 "query": query,
                 "answer": answer,
                 "sources": [
@@ -204,47 +204,28 @@ if st.button("Get Answer"):
                     } for doc_id, data in doc_sources.items()
                 ],
                 "timestamp": datetime.datetime.utcnow()
-            })
+            }
+            query_results_collection.insert_one(query_result)
 
-            # Build and render HTML table dynamically
-            html_table = """
-            <style>
-                .data-table {
-                    width: 100%;
-                    border-collapse: collapse;
-                    margin: 10px 0;
+            # Create table data
+            table_data = [
+                {
+                    "Document ID": doc_id,
+                    "Extracted Answer": data["answer"],
+                    "Citation": "<br>".join(sorted(data["citations"]))
                 }
-                .data-table th, .data-table td {
-                    border: 1px solid #ddd;
-                    padding: 8px;
-                    text-align: left;
-                }
-                .data-table th {
-                    background-color: #f2f2f2;
-                }
-            </style>
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th>Document ID</th>
-                        <th>Extracted Answer</th>
-                        <th>Citation</th>
-                    </tr>
-                </thead>
-                <tbody>
-            """
+                for doc_id, data in doc_sources.items()
+            ]
+        
+       # Display as DataFrame
+            if table_data:
+                df = pd.DataFrame(table_data)
+                st.dataframe(df, use_container_width=True)
+            else:
+                st.warning("No sources found for this query.")
 
-            for doc_id, data in doc_sources.items():
-                citations = sorted(data["citations"])
-                html_table += f"""
-                    <tr>
-                        <td>{doc_id}</td>
-                        <td>{data['answer']}</td>
-                        <td>{"<br>".join(citations)}</td>
-                    </tr>
-                """
+            # Optionally store table_data in session_state for reuse
+            st.session_state.table_data = table_data
 
-            html_table += "</tbody></table>"
-
-            st.markdown(html_table, unsafe_allow_html=True)
-            st.session_state.chat_history.append(("Assistant", html_table))
+            # Add to chat history
+            st.session_state.chat_history.append(("Assistant", table_data))
