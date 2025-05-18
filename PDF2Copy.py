@@ -15,6 +15,8 @@ import streamlit as st
 from pymongo import MongoClient
 import datetime
 import pandas as pd
+from sklearn.cluster import KMeans
+import numpy as np
 
 # MongoDB setup
 MONGO_URI = "mongodb+srv://choprasa:Savi3650@cluster1.f2mxsnf.mongodb.net/?retryWrites=true&w=majority&appName=Cluster1"
@@ -88,10 +90,29 @@ def load_documents(files):
         if suffix in [".jpg", ".jpeg", ".png"]:
             text = extract_text_from_image(file)
             if text.strip():
-                metadata = {"file_name": file.name, "file_type": "image", "page": "N/A", "paragraph": "N/A"}
-                if not collection.find_one({"file_name": file.name, "file_type": "image"}):
-                    collection.insert_one({**metadata, "text": text, "timestamp": datetime.datetime.utcnow()})
-                documents.append(Document(page_content=text, metadata=metadata))
+                metadata = {
+                    "file_name": file.name,
+                    "file_type": "image",
+                    "page": "N/A",
+                    "paragraph": "N/A"
+                }
+                # Check if document exists
+                if not collection.find_one({
+                    "file_name": metadata["file_name"],
+                    "page": metadata["page"],
+                    "paragraph": metadata["paragraph"]
+                }):
+                    try:
+                        collection.insert_one({
+                            **metadata,
+                            "text": text,
+                            "timestamp": datetime.datetime.utcnow()
+                        })
+                    except DuplicateKeyError:
+                        st.warning(f"Duplicate document skipped: {metadata['file_name']}")
+                    documents.append(Document(page_content=text, metadata=metadata))
+                else:
+                    st.info(f"Document already exists: {metadata['file_name']}")
 
         elif suffix == ".pdf":
             try:
@@ -101,10 +122,29 @@ def load_documents(files):
                     if page_text.strip():
                         paragraphs = [p.strip() for p in page_text.split('\n\n') if p.strip()]
                         for para_num, para_text in enumerate(paragraphs, 1):
-                            metadata = {"file_name": file.name, "file_type": "pdf", "page": i + 1, "paragraph": para_num}
-                            if not collection.find_one({"file_name": file.name, "page": i + 1, "paragraph": para_num}):
-                                collection.insert_one({**metadata, "text": para_text, "timestamp": datetime.datetime.utcnow()})
-                            documents.append(Document(page_content=para_text, metadata=metadata))
+                            metadata = {
+                                "file_name": file.name,
+                                "file_type": "pdf",
+                                "page": i + 1,
+                                "paragraph": para_num
+                            }
+                            # Check if document exists
+                            if not collection.find_one({
+                                "file_name": metadata["file_name"],
+                                "page": metadata["page"],
+                                "paragraph": metadata["paragraph"]
+                            }):
+                                try:
+                                    collection.insert_one({
+                                        **metadata,
+                                        "text": para_text,
+                                        "timestamp": datetime.datetime.utcnow()
+                                    })
+                                except DuplicateKeyError:
+                                    st.warning(f"Duplicate document skipped: {metadata['file_name']}, Page {metadata['page']}, Para {metadata['paragraph']}")
+                                documents.append(Document(page_content=para_text, metadata=metadata))
+                            else:
+                                st.info(f"Document already exists: {metadata['file_name']}, Page {metadata['page']}, Para {metadata['paragraph']}")
             except Exception as e:
                 st.error(f"Error reading PDF {file.name}: {e}")
     return documents
@@ -144,6 +184,65 @@ def answer_query(qa_chain, query):
     result = qa_chain({"query": query})
     return result['result'], result.get('source_documents', [])
 
+def perform_theme_synthesis(doc_sources, model, embedding_model):
+    query = st.session_state.get("current_query", "default_query")  # Track query
+    # Check cache
+    cached = clusters_collection.find_one({"query": query})
+    if cached:
+        return cached["themes"]
+    
+    # Existing clustering logic
+    response_texts = [data['answer'] for doc_id, data in doc_sources.items()]
+    response_embeddings = embedding_model.embed_documents(response_texts)
+    num_clusters = min(len(response_texts), 5)
+    if num_clusters < 2:
+        num_clusters = 2
+    kmeans = KMeans(n_clusters=num_clusters, random_state=42)
+    cluster_labels = kmeans.fit_predict(response_embeddings)
+    
+    clustered_responses = {}
+    for idx, (doc_id, data) in enumerate(doc_sources.items()):
+        cluster_id = cluster_labels[idx]
+        if cluster_id not in clustered_responses:
+            clustered_responses[cluster_id] = []
+        clustered_responses[cluster_id].append(f"From {doc_id}: {data['answer']} (Citations: {', '.join(data['citations'])})")
+    
+    synthesis_prompt = PromptTemplate.from_template("""
+    You are a research assistant synthesizing insights from documents.
+    Given the following clustered findings:
+    {context}
+    1. Name the theme for this cluster (e.g., "Regulatory Non-Compliance").
+    2. Provide a concise description (1–2 sentences).
+    3. List all relevant documents with citations (document ID, page, paragraph).
+    Return the response in markdown, e.g.:
+    ### Theme - [Theme Name]
+    [Description]
+    - [Document ID]: Page [X], Para [Y]
+    """)
+    
+    results = []
+    for cluster_id, texts in clustered_responses.items():
+        context = "\n".join(texts)
+        synthesis_chain = RetrievalQA.from_chain_type(
+            llm=model,
+            chain_type="stuff",
+            retriever=None,
+            return_source_documents=False,
+            chain_type_kwargs={"prompt": synthesis_prompt}
+        )
+        result = synthesis_chain({"query": "Synthesize the theme for this cluster.", "context": context})
+        results.append(result["result"])
+    
+    # Cache results
+    clusters_collection.insert_one({
+        "query": query,
+        "cluster_labels": {doc_id: int(label) for doc_id, label in zip(doc_sources.keys(), cluster_labels)},
+        "clustered_responses": clustered_responses,
+        "themes": "\n\n".join(results),
+        "timestamp": datetime.datetime.utcnow()
+    })
+    
+    return "\n\n".join(results)
 # Streamlit UI
 st.set_page_config(page_title="Multi-Document QA with Citations", layout="wide")
 st.title("\U0001F4DA Multi-File Document QA (PDF + Images) with Citations")
